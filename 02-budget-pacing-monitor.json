@@ -1,0 +1,195 @@
+{
+  "name": "al-ai | Budget Pacing Monitor",
+  "nodes": [
+    {
+      "id": "cron-2h",
+      "name": "Cron — Every 2 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [80, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 2 }]
+        }
+      }
+    },
+    {
+      "id": "fetch-adsets",
+      "name": "GET — Active ad sets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{$env.META_AD_ACCOUNT_ID}}/adsets",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "access_token", "value": "={{$env.META_ACCESS_TOKEN}}" },
+            { "name": "fields",       "value": "id,name,daily_budget,campaign_id,effective_status" },
+            { "name": "filtering",    "value": "[{\"field\":\"effective_status\",\"operator\":\"IN\",\"value\":[\"ACTIVE\"]}]" },
+            { "name": "limit",        "value": "100" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "fetch-today-spend",
+      "name": "GET — Today spend by ad set",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{$env.META_AD_ACCOUNT_ID}}/insights",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "access_token", "value": "={{$env.META_ACCESS_TOKEN}}" },
+            { "name": "date_preset",  "value": "today" },
+            { "name": "level",        "value": "adset" },
+            { "name": "fields",       "value": "adset_id,adset_name,campaign_name,spend" },
+            { "name": "limit",        "value": "100" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "calculate-pacing",
+      "name": "Code — Calculate pacing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, 300],
+      "parameters": {
+        "jsCode": "// Get current hour fraction in AST (UTC+3)\nconst nowUtc = new Date();\nconst astHour = (nowUtc.getUTCHours() + 3) % 24;\nconst hourFraction = (astHour * 60 + nowUtc.getUTCMinutes()) / (24 * 60);\nconst expectedPct = hourFraction * 100;\n\nconst adSets = $('GET — Active ad sets').item.json.data ?? [];\nconst insights = $('GET — Today spend by ad set').item.json.data ?? [];\n\nconst spendMap = {};\ninsights.forEach(i => { spendMap[i.adset_id] = parseFloat(i.spend ?? 0); });\n\nconst alerts = [];\n\nfor (const as of adSets) {\n  const budget = parseInt(as.daily_budget ?? 0) / 100;\n  if (budget <= 0) continue;\n\n  const spent = spendMap[as.id] ?? 0;\n  const pacingPct = (spent / budget) * 100;\n  const delta = pacingPct - expectedPct;\n\n  let severity = 'ok';\n  let message = '';\n  let recommendation = '';\n\n  if (pacingPct >= 100) {\n    severity = 'critical';\n    message = `Budget EXHAUSTED ($${spent.toFixed(2)} / $${budget})`;\n    recommendation = 'Increase daily budget immediately or pause until tomorrow';\n  } else if (pacingPct >= 90) {\n    severity = 'critical';\n    message = `Near budget cap — ${pacingPct.toFixed(1)}% spent`;\n    recommendation = `Add $${(budget * 0.25).toFixed(0)} to prevent early stop`;\n  } else if (delta > 25 && hourFraction > 0.1) {\n    severity = 'warning';\n    message = `Overpacing by ${delta.toFixed(0)}% — may exhaust budget early`;\n    recommendation = 'Monitor or increase budget';\n  } else if (delta < -30 && hourFraction > 0.3) {\n    severity = 'warning';\n    message = `Underpacing — only ${pacingPct.toFixed(1)}% vs ${expectedPct.toFixed(1)}% expected`;\n    recommendation = 'Check audience size, bids, creative quality';\n  }\n\n  if (severity !== 'ok') {\n    alerts.push({\n      adsetId: as.id,\n      adsetName: as.name,\n      severity,\n      message,\n      recommendation,\n      budget,\n      spent: spent.toFixed(2),\n      pacingPct: pacingPct.toFixed(1),\n      expectedPct: expectedPct.toFixed(1),\n      astHour: Math.round(astHour),\n    });\n  }\n}\n\nreturn alerts.length > 0\n  ? alerts.map(a => ({ json: a }))\n  : [{ json: { noAlerts: true } }];"
+      }
+    },
+    {
+      "id": "has-alerts",
+      "name": "IF — Has alerts?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [960, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-no-alerts",
+              "leftValue": "={{ $json.noAlerts }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "is-critical",
+      "name": "IF — Critical severity?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1180, 440],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-critical",
+              "leftValue": "={{ $json.severity }}",
+              "rightValue": "critical",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "slack-critical",
+      "name": "POST — Slack: Critical alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1400, 340],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "text": "=:rotating_light: *CRITICAL — Budget Alert*\n*Ad Set:* {{ $json.adsetName }}\n*Status:* {{ $json.message }}\n*Spent:* ${{ $json.spent }} / ${{ $json.budget }}\n*Pacing:* {{ $json.pacingPct }}% (expected {{ $json.expectedPct }}%)\n*Action:* {{ $json.recommendation }}"
+          }
+        }
+      }
+    },
+    {
+      "id": "slack-warning",
+      "name": "POST — Slack: Warning alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1400, 540],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "text": "=:warning: *Budget Warning*\n*Ad Set:* {{ $json.adsetName }}\n*{{ $json.message }}*\n*Recommendation:* {{ $json.recommendation }}"
+          }
+        }
+      }
+    },
+    {
+      "id": "webhook-trigger-manual",
+      "name": "Webhook — Manual check trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [80, 560],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "budget-check",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "webhook-response",
+      "name": "Respond — Alerts JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1620, 440],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ alerts: $('Code — Calculate pacing').all().map(i => i.json), timestamp: new Date().toISOString() }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Cron — Every 2 hours":          { "main": [[{ "node": "GET — Active ad sets",          "type": "main", "index": 0 }]] },
+    "Webhook — Manual check trigger": { "main": [[{ "node": "GET — Active ad sets",          "type": "main", "index": 0 }]] },
+    "GET — Active ad sets":           { "main": [[{ "node": "GET — Today spend by ad set",   "type": "main", "index": 0 }]] },
+    "GET — Today spend by ad set":    { "main": [[{ "node": "Code — Calculate pacing",       "type": "main", "index": 0 }]] },
+    "Code — Calculate pacing":        { "main": [[{ "node": "IF — Has alerts?",              "type": "main", "index": 0 }]] },
+    "IF — Has alerts?": {
+      "main": [
+        [{ "node": "IF — Critical severity?", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "IF — Critical severity?": {
+      "main": [
+        [{ "node": "POST — Slack: Critical alert", "type": "main", "index": 0 }],
+        [{ "node": "POST — Slack: Warning alert",  "type": "main", "index": 0 }]
+      ]
+    },
+    "POST — Slack: Critical alert": { "main": [[{ "node": "Respond — Alerts JSON", "type": "main", "index": 0 }]] },
+    "POST — Slack: Warning alert":  { "main": [[{ "node": "Respond — Alerts JSON", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": ["meta-ads", "al-ai", "budget", "alerts", "gulf"]
+}

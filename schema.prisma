@@ -1,0 +1,88 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+model Client {
+  id            String   @id @default(cuid())
+  name          String
+  slug          String   @unique
+  metaAccountId String   @unique
+  markets       String[] @default(["SA"])
+  primaryColor  String?  @default("#F59E0B")
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  snapshots     CampaignSnapshot[]
+  reports       Report[]
+  shareLinks    ShareLink[]
+}
+model CampaignSnapshot {
+  id           String   @id @default(cuid())
+  clientId     String
+  campaignId   String
+  campaignName String
+  date         DateTime @db.Date
+  country      String
+  spend        Float    @default(0)
+  impressions  Int      @default(0)
+  clicks       Int      @default(0)
+  ctr          Float    @default(0)
+  cpm          Float    @default(0)
+  leads        Int      @default(0)
+  roas         Float    @default(0)
+  createdAt    DateTime @default(now())
+  client       Client   @relation(fields:[clientId],references:[id],onDelete:Cascade)
+  @@unique([clientId,campaignId,date])
+  @@index([clientId,date])
+}
+model Report {
+  id           String   @id @default(cuid())
+  clientId     String
+  period       String
+  periodType   String
+  dateFrom     DateTime @db.Date
+  dateTo       DateTime @db.Date
+  narrativeEn  String   @db.Text
+  narrativeAr  String   @db.Text
+  metricsJson  Json
+  status       String   @default("draft")
+  pdfUrl       String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  client       Client   @relation(fields:[clientId],references:[id],onDelete:Cascade)
+  shareLinks   ShareLink[]
+}
+model ShareLink {
+  id        String   @id @default(cuid())
+  token     String   @unique @default(cuid())
+  clientId  String
+  reportId  String
+  label     String?
+  password  String?
+  active    Boolean  @default(true)
+  viewCount Int      @default(0)
+  expiresAt DateTime?
+  createdAt DateTime @default(now())
+  client    Client   @relation(fields:[clientId],references:[id],onDelete:Cascade)
+  report    Report   @relation(fields:[reportId],references:[id],onDelete:Cascade)
+  @@index([token])
+}
+enum Role {
+  ADMIN
+  ACCOUNT_MGR
+  CLIENT_VIEW
+}
+model User {
+  id               String   @id @default(cuid())
+  email            String   @unique
+  name             String?
+  password         String?
+  role             Role     @default(CLIENT_VIEW)
+  allowedClientIds String[] @default([])
+  active           Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}

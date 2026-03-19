@@ -1,0 +1,172 @@
+# docker/docker-compose.prod.yml
+# Production stack: nginx + dashboard + n8n + postgres + redis
+# Usage: docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+version: "3.9"
+
+services:
+  # ─── Nginx reverse proxy + SSL ───────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - al-ai-network
+
+  # ─── Next.js Dashboard ───────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: ../apps/dashboard
+      dockerfile: ../../docker/dashboard.Dockerfile
+      args:
+        NODE_ENV: production
+    expose:
+      - "3000"
+    environment:
+      - NODE_ENV=production
+      # Meta
+      - META_ACCESS_TOKEN=${META_ACCESS_TOKEN}
+      - META_AD_ACCOUNT_ID=${META_AD_ACCOUNT_ID}
+      - META_PAGE_ID=${META_PAGE_ID}
+      - META_PIXEL_ID=${META_PIXEL_ID}
+      # Anthropic
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Database
+      - DATABASE_URL=postgresql://app:${POSTGRES_APP_PASSWORD}@postgres:5432/alai_ads
+      # Redis
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      # Auth
+      - NEXTAUTH_URL=${NEXT_PUBLIC_APP_URL}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+      # Internal
+      - SYNC_SECRET=${SYNC_SECRET}
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+      # Storage
+      - PDF_STORAGE=${PDF_STORAGE:-r2}
+      - R2_BUCKET_NAME=${R2_BUCKET_NAME}
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - R2_PUBLIC_URL=${R2_PUBLIC_URL}
+      # Notifications
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - ALERT_EMAIL=${ALERT_EMAIL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - al-ai-network
+
+  # ─── n8n ─────────────────────────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:1.72.1
+    expose:
+      - "5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD}
+      - N8N_HOST=n8n.al-ai.ai
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://n8n.al-ai.ai
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_N8N_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - META_ACCESS_TOKEN=${META_ACCESS_TOKEN}
+      - META_AD_ACCOUNT_ID=${META_AD_ACCOUNT_ID}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - ALERT_EMAIL=${ALERT_EMAIL}
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - SYNC_SECRET=${SYNC_SECRET}
+      - DASHBOARD_URL=http://dashboard:3000
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    user: "node"
+    networks:
+      - al-ai-network
+
+  # ─── Postgres ─────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_ROOT_PASSWORD}
+      - POSTGRES_MULTIPLE_DATABASES=alai_ads:app:${POSTGRES_APP_PASSWORD},n8n:n8n:${POSTGRES_N8N_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - al-ai-network
+
+  # ─── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD}
+      --save 60 1
+      --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - al-ai-network
+
+volumes:
+  n8n_data:
+  postgres_data:
+  redis_data:
+  nginx_logs:
+
+networks:
+  al-ai-network:
+    driver: bridge

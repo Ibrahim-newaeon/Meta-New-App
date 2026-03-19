@@ -1,0 +1,205 @@
+{
+  "name": "al-ai | Weekly Report — Claude Narrative + Email",
+  "nodes": [
+    {
+      "id": "cron-monday",
+      "name": "Cron — Monday 08:00 AST",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [80, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 5 * * 1" }]
+        }
+      }
+    },
+    {
+      "id": "fetch-weekly-insights",
+      "name": "GET — Meta Insights (last 7d)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{$env.META_AD_ACCOUNT_ID}}/insights",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "access_token",  "value": "={{$env.META_ACCESS_TOKEN}}" },
+            { "name": "date_preset",   "value": "last_7d" },
+            { "name": "level",         "value": "campaign" },
+            { "name": "fields",        "value": "campaign_id,campaign_name,spend,impressions,reach,clicks,ctr,cpm,cpc,frequency,actions,purchase_roas,outbound_clicks,landing_page_views" },
+            { "name": "limit",         "value": "50" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "fetch-lifetime",
+      "name": "GET — Account lifetime stats",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 460],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{$env.META_AD_ACCOUNT_ID}}/insights",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "access_token",  "value": "={{$env.META_ACCESS_TOKEN}}" },
+            { "name": "date_preset",   "value": "this_month" },
+            { "name": "level",         "value": "account" },
+            { "name": "fields",        "value": "spend,impressions,clicks,ctr,cpm,purchase_roas,actions" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "aggregate-data",
+      "name": "Code — Aggregate + format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 380],
+      "parameters": {
+        "jsCode": "const weekly = $('GET — Meta Insights (last 7d)').item.json.data ?? [];\nconst monthly = $('GET — Account lifetime stats').item.json.data?.[0] ?? {};\n\nconst totalSpend = weekly.reduce((s, c) => s + parseFloat(c.spend ?? 0), 0);\nconst totalImpressions = weekly.reduce((s, c) => s + parseInt(c.impressions ?? 0), 0);\nconst totalClicks = weekly.reduce((s, c) => s + parseInt(c.clicks ?? 0), 0);\nconst totalLeads = weekly.reduce((s, c) => {\n  const lead = c.actions?.find(a => a.action_type === 'lead');\n  return s + parseInt(lead?.value ?? 0);\n}, 0);\n\nconst avgRoas = weekly.filter(c => c.purchase_roas?.[0]?.value)\n  .reduce((s, c) => s + parseFloat(c.purchase_roas[0].value), 0) /\n  Math.max(weekly.filter(c => c.purchase_roas?.[0]?.value).length, 1);\n\nconst sorted = [...weekly].sort((a, b) => {\n  const rA = parseFloat(a.purchase_roas?.[0]?.value ?? 0);\n  const rB = parseFloat(b.purchase_roas?.[0]?.value ?? 0);\n  return rB - rA;\n});\n\nconst now = new Date();\nconst weekStr = `${now.getFullYear()}-W${String(Math.ceil(now.getDate() / 7)).padStart(2, '0')}`;\n\nreturn [{ json: {\n  period: weekStr,\n  weekly: { campaigns: weekly, totalSpend: totalSpend.toFixed(2), totalImpressions, totalClicks, totalLeads, avgRoas: avgRoas.toFixed(2), avgCtr: totalImpressions > 0 ? ((totalClicks / totalImpressions) * 100).toFixed(2) : '0', avgCpm: totalImpressions > 0 ? ((totalSpend / totalImpressions) * 1000).toFixed(2) : '0' },\n  monthly: { spend: monthly.spend ?? 0, impressions: monthly.impressions ?? 0 },\n  topCampaign: sorted[0]?.campaign_name ?? 'N/A',\n  worstCampaign: sorted[sorted.length - 1]?.campaign_name ?? 'N/A',\n  campaignCount: weekly.length,\n}}];"
+      }
+    },
+    {
+      "id": "claude-report-en",
+      "name": "POST — Claude: English report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [740, 260],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key",        "value": "={{$env.ANTHROPIC_API_KEY}}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type",      "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1500,
+            "system": "You are a performance marketing analyst writing weekly reports for Gulf market clients. Write in clear, professional English. Be specific with numbers. Structure: Executive Summary → Key Metrics → What Worked → What Needs Attention → Next Week Recommendations. Max 400 words.",
+            "messages": [
+              {
+                "role": "user",
+                "content": "=Write the weekly Meta Ads performance report for al-ai.ai, period {{ $json.period }}:\n\n{{ JSON.stringify($json.weekly, null, 2) }}\n\nTop campaign: {{ $json.topCampaign }}\nWorst campaign: {{ $json.worstCampaign }}"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "claude-report-ar",
+      "name": "POST — Claude: Arabic report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [740, 460],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key",        "value": "={{$env.ANTHROPIC_API_KEY}}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type",      "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1500,
+            "system": "أنت محلل تسويق رقمي متخصص في أسواق الخليج. اكتب تقرير أسبوعي احترافي باللغة العربية الفصحى. الهيكل: ملخص تنفيذي، المؤشرات الرئيسية، ما نجح، ما يحتاج مراجعة، توصيات الأسبوع القادم. الحد الأقصى 350 كلمة.",
+            "messages": [
+              {
+                "role": "user",
+                "content": "=اكتب تقرير أداء إعلانات ميتا الأسبوعي لـ al-ai.ai للفترة {{ $json.period }}:\n\nالإنفاق الإجمالي: ${{ $json.weekly.totalSpend }}\nإجمالي الظهور: {{ $json.weekly.totalImpressions }}\nالنقرات: {{ $json.weekly.totalClicks }}\nالعملاء المحتملون: {{ $json.weekly.totalLeads }}\nمتوسط ROAS: {{ $json.weekly.avgRoas }}x\nمتوسط CTR: {{ $json.weekly.avgCtr }}%\nمتوسط CPM: ${{ $json.weekly.avgCpm }}\nأفضل حملة: {{ $json.topCampaign }}"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "merge-reports",
+      "name": "Code — Merge EN + AR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 360],
+      "parameters": {
+        "jsCode": "const enText = $('POST — Claude: English report').item.json.content?.[0]?.text ?? '';\nconst arText = $('POST — Claude: Arabic report').item.json.content?.[0]?.text ?? '';\nconst data = $('Code — Aggregate + format').item.json;\n\nreturn [{ json: { enReport: enText, arReport: arText, metrics: data.weekly, period: data.period } }];"
+      }
+    },
+    {
+      "id": "send-email",
+      "name": "POST — Send report email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 360],
+      "notes": "Replace with Gmail / Mailgun / Resend node + credentials",
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.resend.com/emails",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{$env.RESEND_API_KEY}}" },
+            { "name": "Content-Type",  "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "from": "reports@al-ai.ai",
+            "to": ["={{ $env.ALERT_EMAIL }}"],
+            "subject": "=al-ai.ai Weekly Meta Ads Report — {{ $json.period }}",
+            "html": "=<html><body style='font-family:sans-serif;max-width:640px;margin:0 auto;padding:20px'><h2 style='color:#F59E0B'>al-ai.ai — Weekly Ads Report {{ $json.period }}</h2><h3>Key Metrics</h3><table style='border-collapse:collapse;width:100%'><tr><td style='padding:8px;border:1px solid #ddd'>Total Spend</td><td style='padding:8px;border:1px solid #ddd;font-weight:600'>${{ $json.metrics.totalSpend }}</td></tr><tr><td style='padding:8px;border:1px solid #ddd'>Avg ROAS</td><td style='padding:8px;border:1px solid #ddd;font-weight:600'>{{ $json.metrics.avgRoas }}x</td></tr><tr><td style='padding:8px;border:1px solid #ddd'>Avg CTR</td><td style='padding:8px;border:1px solid #ddd;font-weight:600'>{{ $json.metrics.avgCtr }}%</td></tr><tr><td style='padding:8px;border:1px solid #ddd'>Total Leads</td><td style='padding:8px;border:1px solid #ddd;font-weight:600'>{{ $json.metrics.totalLeads }}</td></tr></table><hr/><h3>English Report</h3><p style='white-space:pre-wrap'>{{ $json.enReport }}</p><hr/><h3 dir='rtl'>التقرير بالعربية</h3><p dir='rtl' style='white-space:pre-wrap'>{{ $json.arReport }}</p></body></html>"
+          }
+        }
+      }
+    },
+    {
+      "id": "slack-report-notify",
+      "name": "POST — Slack: Report sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1400, 360],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "text": "=:bar_chart: *Weekly Report Sent — {{ $json.period }}*\nSpend: ${{ $json.metrics.totalSpend }} | ROAS: {{ $json.metrics.avgRoas }}x | CTR: {{ $json.metrics.avgCtr }}%\nReport delivered to {{ $env.ALERT_EMAIL }} (EN + AR)"
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Cron — Monday 08:00 AST":        { "main": [[{ "node": "GET — Meta Insights (last 7d)", "type": "main", "index": 0 }], [{ "node": "GET — Account lifetime stats", "type": "main", "index": 0 }]] },
+    "GET — Meta Insights (last 7d)":  { "main": [[{ "node": "Code — Aggregate + format",    "type": "main", "index": 0 }]] },
+    "GET — Account lifetime stats":   { "main": [[{ "node": "Code — Aggregate + format",    "type": "main", "index": 0 }]] },
+    "Code — Aggregate + format":      { "main": [[{ "node": "POST — Claude: English report", "type": "main", "index": 0 }], [{ "node": "POST — Claude: Arabic report", "type": "main", "index": 0 }]] },
+    "POST — Claude: English report":  { "main": [[{ "node": "Code — Merge EN + AR",         "type": "main", "index": 0 }]] },
+    "POST — Claude: Arabic report":   { "main": [[{ "node": "Code — Merge EN + AR",         "type": "main", "index": 0 }]] },
+    "Code — Merge EN + AR":           { "main": [[{ "node": "POST — Send report email",     "type": "main", "index": 0 }]] },
+    "POST — Send report email":       { "main": [[{ "node": "POST — Slack: Report sent",    "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": ["meta-ads", "al-ai", "reporting", "weekly", "bilingual"]
+}

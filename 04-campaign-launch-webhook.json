@@ -1,0 +1,205 @@
+{
+  "name": "al-ai | Campaign Launch Webhook",
+  "nodes": [
+    {
+      "id": "webhook-launch",
+      "name": "Webhook — Campaign brief",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [80, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "launch-campaign",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      }
+    },
+    {
+      "id": "validate-brief",
+      "name": "Code — Validate brief",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [300, 300],
+      "parameters": {
+        "jsCode": "const body = $input.item.json.body;\nconst errors = [];\n\nif (!body.brand) errors.push('brand required');\nif (!body.product) errors.push('product required');\nif (!body.objective) errors.push('objective required');\nif (!body.dailyBudgetUSD || body.dailyBudgetUSD < 5) errors.push('dailyBudgetUSD must be >= 5');\nif (!body.targetCountries?.length) errors.push('targetCountries required (array)');\nif (!body.startDate) errors.push('startDate required');\n\nconst validObjectives = ['OUTCOME_LEADS','OUTCOME_SALES','OUTCOME_AWARENESS','OUTCOME_TRAFFIC'];\nif (body.objective && !validObjectives.includes(body.objective)) errors.push(`Invalid objective. Must be: ${validObjectives.join(', ')}`);\n\nif (errors.length) {\n  return [{ json: { valid: false, errors } }];\n}\n\nreturn [{ json: { valid: true, brief: body } }];"
+      }
+    },
+    {
+      "id": "check-valid",
+      "name": "IF — Valid brief?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [520, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "valid-check",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "respond-invalid",
+      "name": "Respond — Validation error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [740, 460],
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 400,
+        "responseBody": "={{ JSON.stringify({ success: false, errors: $json.errors }) }}"
+      }
+    },
+    {
+      "id": "claude-generate",
+      "name": "POST — Claude: Generate campaign",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [740, 260],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key",        "value": "={{$env.ANTHROPIC_API_KEY}}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type",      "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 2000,
+            "system": "You are a Meta Ads campaign architect for Gulf markets (SA, KW, QA, JO). Return ONLY valid JSON — no markdown, no preamble.\n\nJSON structure:\n{\n  \"campaignName\": \"[Brand]_[Objective]_[Countries]_[YYYYMM]\",\n  \"adSetName\": \"[Countries]_[AgeRange]_[Gender]_[Placement]\",\n  \"targeting_spec\": { valid Meta targeting_spec },\n  \"optimization_goal\": \"string\",\n  \"billing_event\": \"IMPRESSIONS\",\n  \"creatives\": [\n    { \"lang\": \"ar\"|\"en\", \"headline\": \"≤40 chars\", \"primaryText\": \"≤125 chars\", \"description\": \"≤30 chars\", \"cta\": \"META_CTA\" }\n  ]\n}",
+            "messages": [
+              {
+                "role": "user",
+                "content": "=Generate campaign payload for:\nBrand: {{ $json.brief.brand }}\nProduct: {{ $json.brief.product }}\nObjective: {{ $json.brief.objective }}\nBudget: ${{ $json.brief.dailyBudgetUSD }}/day\nCountries: {{ $json.brief.targetCountries.join(', ') }}\nAge: {{ $json.brief.targetAgeMin ?? 25 }}–{{ $json.brief.targetAgeMax ?? 55 }}\nLanguage: {{ $json.brief.language ?? 'both' }}\nTone: {{ $json.brief.tone ?? 'professional' }}\n\nCreate 3 Arabic + 2 English creative variants. Include locales [28] for Arabic, [6] for English."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "parse-payload",
+      "name": "Code — Parse Claude payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 260],
+      "parameters": {
+        "jsCode": "const text = $input.item.json.content?.[0]?.text ?? '{}';\nconst clean = text.replace(/```(?:json)?\\n?/g, '').trim();\ntry {\n  const payload = JSON.parse(clean);\n  const brief = $('IF — Valid brief?').item.json.brief;\n  return [{ json: { payload, brief } }];\n} catch (e) {\n  throw new Error('Claude returned invalid JSON: ' + e.message);\n}"
+      }
+    },
+    {
+      "id": "create-campaign",
+      "name": "POST — Meta: Create campaign",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 260],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{$env.META_AD_ACCOUNT_ID}}/campaigns",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "name": "={{ $json.payload.campaignName }}",
+            "objective": "={{ $json.brief.objective }}",
+            "status": "PAUSED",
+            "special_ad_categories": [],
+            "access_token": "={{$env.META_ACCESS_TOKEN}}"
+          }
+        }
+      }
+    },
+    {
+      "id": "create-adset",
+      "name": "POST — Meta: Create ad set",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1400, 260],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{$env.META_AD_ACCOUNT_ID}}/adsets",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "campaign_id": "={{ $('POST — Meta: Create campaign').item.json.id }}",
+            "name": "={{ $('Code — Parse Claude payload').item.json.payload.adSetName }}",
+            "daily_budget": "={{ Math.round($('Code — Parse Claude payload').item.json.brief.dailyBudgetUSD * 100) }}",
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "={{ $('Code — Parse Claude payload').item.json.payload.optimization_goal }}",
+            "targeting": "={{ $('Code — Parse Claude payload').item.json.payload.targeting_spec }}",
+            "attribution_spec": [
+              { "event_type": "CLICK_THROUGH", "window_days": 7 },
+              { "event_type": "VIEW_THROUGH",  "window_days": 1 }
+            ],
+            "status": "PAUSED",
+            "access_token": "={{$env.META_ACCESS_TOKEN}}"
+          }
+        }
+      }
+    },
+    {
+      "id": "slack-launch-success",
+      "name": "POST — Slack: Launch notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 260],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "text": "=:rocket: *New Campaign Created — Pending Review*\n*Campaign:* {{ $('Code — Parse Claude payload').item.json.payload.campaignName }}\n*Budget:* ${{ $('Code — Parse Claude payload').item.json.brief.dailyBudgetUSD }}/day\n*Markets:* {{ $('Code — Parse Claude payload').item.json.brief.targetCountries.join(', ') }}\n*Status:* PAUSED — activate after review in Meta Ads Manager\n*Campaign ID:* {{ $('POST — Meta: Create campaign').item.json.id }}"
+          }
+        }
+      }
+    },
+    {
+      "id": "respond-success",
+      "name": "Respond — Launch success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1840, 260],
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 200,
+        "responseBody": "={{ JSON.stringify({ success: true, campaignId: $('POST — Meta: Create campaign').item.json.id, adSetId: $('POST — Meta: Create ad set').item.json.id, status: 'PAUSED', message: 'Campaign created. Review and activate in Meta Ads Manager.' }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook — Campaign brief":        { "main": [[{ "node": "Code — Validate brief",             "type": "main", "index": 0 }]] },
+    "Code — Validate brief":           { "main": [[{ "node": "IF — Valid brief?",                 "type": "main", "index": 0 }]] },
+    "IF — Valid brief?": {
+      "main": [
+        [{ "node": "POST — Claude: Generate campaign", "type": "main", "index": 0 }],
+        [{ "node": "Respond — Validation error",       "type": "main", "index": 0 }]
+      ]
+    },
+    "POST — Claude: Generate campaign": { "main": [[{ "node": "Code — Parse Claude payload",   "type": "main", "index": 0 }]] },
+    "Code — Parse Claude payload":      { "main": [[{ "node": "POST — Meta: Create campaign",  "type": "main", "index": 0 }]] },
+    "POST — Meta: Create campaign":     { "main": [[{ "node": "POST — Meta: Create ad set",    "type": "main", "index": 0 }]] },
+    "POST — Meta: Create ad set":       { "main": [[{ "node": "POST — Slack: Launch notification","type": "main", "index": 0 }]] },
+    "POST — Slack: Launch notification":{ "main": [[{ "node": "Respond — Launch success",      "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": ["meta-ads", "al-ai", "launch", "webhook", "claude"]
+}

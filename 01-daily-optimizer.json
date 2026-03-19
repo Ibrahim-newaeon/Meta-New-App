@@ -1,0 +1,265 @@
+{
+  "name": "al-ai | Daily Performance Optimizer",
+  "nodes": [
+    {
+      "id": "trigger-daily",
+      "name": "Cron — 06:00 AST Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [80, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 3 * * *" }]
+        }
+      }
+    },
+    {
+      "id": "fetch-insights",
+      "name": "GET — Meta Insights (yesterday)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{$env.META_AD_ACCOUNT_ID}}/insights",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "access_token",  "value": "={{$env.META_ACCESS_TOKEN}}" },
+            { "name": "date_preset",   "value": "yesterday" },
+            { "name": "level",         "value": "campaign" },
+            { "name": "fields",        "value": "campaign_id,campaign_name,status,spend,impressions,clicks,ctr,cpm,cpc,purchase_roas,actions" },
+            { "name": "limit",         "value": "50" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "prepare-for-claude",
+      "name": "Code — Build Claude prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 300],
+      "parameters": {
+        "jsCode": "const insights = $input.item.json.data ?? [];\n\nconst benchmarks = {\n  SA: { cpmMax: 7,  ctrMin: 1.5, cpcMax: 0.45, roasMin: 3.0 },\n  KW: { cpmMax: 8,  ctrMin: 1.8, cpcMax: 0.45, roasMin: 3.5 },\n  QA: { cpmMax: 9,  ctrMin: 1.6, cpcMax: 0.55, roasMin: 3.0 },\n  JO: { cpmMax: 4,  ctrMin: 1.2, cpcMax: 0.30, roasMin: 2.5 },\n};\n\nconst summary = insights.map(c => ({\n  id:      c.campaign_id,\n  name:    c.campaign_name,\n  status:  c.status,\n  spend:   parseFloat(c.spend ?? 0),\n  ctr:     parseFloat(c.ctr ?? 0),\n  cpm:     parseFloat(c.cpm ?? 0),\n  cpc:     parseFloat(c.cpc ?? 0),\n  roas:    parseFloat(c.purchase_roas?.[0]?.value ?? 0),\n  leads:   parseInt(c.actions?.find(a => a.action_type === 'lead')?.value ?? 0),\n}));\n\nreturn [{ json: { insights: summary, benchmarks, date: new Date().toISOString().split('T')[0] } }];"
+      }
+    },
+    {
+      "id": "claude-agent",
+      "name": "POST — Claude Optimizer Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [740, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key",         "value": "={{$env.ANTHROPIC_API_KEY}}" },
+            { "name": "anthropic-version",  "value": "2023-06-01" },
+            { "name": "content-type",       "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 2000,
+            "system": "You are a Meta Ads optimizer for Gulf markets. Analyze campaign performance and return ONLY valid JSON.\n\nRules:\n- Pause campaigns: CTR < 0.5% AND spend > $20\n- Scale budget +20%: ROAS > 4x for any campaign\n- Flag for review: CPM > 1.5x benchmark\n- NEVER exceed $10,000 total daily budget\n\nReturn JSON:\n{\n  \"actions\": [\n    {\n      \"type\": \"pause_campaign\" | \"scale_budget\" | \"flag_review\" | \"no_action\",\n      \"campaign_id\": \"string\",\n      \"campaign_name\": \"string\",\n      \"reason\": \"string\",\n      \"new_budget_cents\": null | number\n    }\n  ],\n  \"summary\": \"2-sentence executive summary\",\n  \"total_spend_yesterday\": number,\n  \"top_performer\": \"campaign name or null\",\n  \"worst_performer\": \"campaign name or null\"\n}",
+            "messages": [
+              {
+                "role": "user",
+                "content": "=Analyze this Meta campaign performance for {{ $json.date }}:\n\n{{ JSON.stringify($json.insights, null, 2) }}\n\nGulf benchmarks:\n{{ JSON.stringify($json.benchmarks, null, 2) }}\n\nProvide optimization actions."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "parse-claude-response",
+      "name": "Code — Parse Claude JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300],
+      "parameters": {
+        "jsCode": "const content = $input.item.json.content?.[0]?.text ?? '{}';\nconst clean = content.replace(/```(?:json)?\\n?/g, '').trim();\ntry {\n  const parsed = JSON.parse(clean);\n  return [{ json: parsed }];\n} catch (e) {\n  return [{ json: { actions: [], summary: 'Parse error: ' + e.message, error: true } }];\n}"
+      }
+    },
+    {
+      "id": "split-actions",
+      "name": "Split — Each action",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1180, 300],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "route-action",
+      "name": "Switch — Action type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1400, 300],
+      "parameters": {
+        "mode": "expression",
+        "output": "={{ $json.type }}",
+        "rules": {
+          "values": [
+            { "outputKey": "pause",  "value": "pause_campaign" },
+            { "outputKey": "scale",  "value": "scale_budget" },
+            { "outputKey": "flag",   "value": "flag_review" }
+          ]
+        },
+        "fallbackOutput": "none"
+      }
+    },
+    {
+      "id": "pause-campaign",
+      "name": "POST — Meta: Pause campaign",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 160],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.campaign_id }}",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "status": "PAUSED",
+            "access_token": "={{$env.META_ACCESS_TOKEN}}"
+          }
+        }
+      }
+    },
+    {
+      "id": "scale-budget",
+      "name": "POST — Meta: Update budget",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.adset_id }}",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "daily_budget": "={{ $json.new_budget_cents }}",
+            "access_token": "={{$env.META_ACCESS_TOKEN}}"
+          }
+        }
+      }
+    },
+    {
+      "id": "slack-flag",
+      "name": "POST — Slack: Flag for review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 440],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "text": "=*al-ai.ai Meta Ads — Review Needed*\n*Campaign:* {{ $json.campaign_name }}\n*Reason:* {{ $json.reason }}\n*Action required:* Manual review in Meta Ads Manager"
+          }
+        }
+      }
+    },
+    {
+      "id": "daily-summary-slack",
+      "name": "POST — Slack: Daily summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "blocks": [
+              {
+                "type": "header",
+                "text": { "type": "plain_text", "text": "al-ai.ai — Daily Ads Report" }
+              },
+              {
+                "type": "section",
+                "text": { "type": "mrkdwn", "text": "={{ $('parse-claude-response').item.json.summary }}" }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  { "type": "mrkdwn", "text": "*Spend yesterday:*\n$={{ $('parse-claude-response').item.json.total_spend_yesterday }}" },
+                  { "type": "mrkdwn", "text": "*Top performer:*\n={{ $('parse-claude-response').item.json.top_performer ?? 'N/A' }}" }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "error-handler",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [80, 560],
+      "parameters": {}
+    },
+    {
+      "id": "slack-error",
+      "name": "POST — Slack: Error alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 560],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "body": {
+          "contentType": "json",
+          "content": {
+            "text": "=:rotating_light: *al-ai.ai Optimizer Error*\nWorkflow: {{ $json.workflow.name }}\nNode: {{ $json.execution.lastNodeExecuted }}\nError: {{ $json.execution.error.message }}"
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Cron — 06:00 AST Daily":        { "main": [[{ "node": "GET — Meta Insights (yesterday)", "type": "main", "index": 0 }]] },
+    "GET — Meta Insights (yesterday)":{ "main": [[{ "node": "Code — Build Claude prompt",      "type": "main", "index": 0 }]] },
+    "Code — Build Claude prompt":     { "main": [[{ "node": "POST — Claude Optimizer Agent",   "type": "main", "index": 0 }]] },
+    "POST — Claude Optimizer Agent":  { "main": [[{ "node": "Code — Parse Claude JSON",        "type": "main", "index": 0 }]] },
+    "Code — Parse Claude JSON":       { "main": [[{ "node": "Split — Each action",             "type": "main", "index": 0 }]] },
+    "Split — Each action":            { "main": [[{ "node": "Switch — Action type",            "type": "main", "index": 0 }]] },
+    "Switch — Action type": {
+      "main": [
+        [{ "node": "POST — Meta: Pause campaign",  "type": "main", "index": 0 }],
+        [{ "node": "POST — Meta: Update budget",   "type": "main", "index": 0 }],
+        [{ "node": "POST — Slack: Flag for review","type": "main", "index": 0 }]
+      ]
+    },
+    "POST — Meta: Pause campaign":   { "main": [[{ "node": "POST — Slack: Daily summary",  "type": "main", "index": 0 }]] },
+    "POST — Meta: Update budget":    { "main": [[{ "node": "POST — Slack: Daily summary",  "type": "main", "index": 0 }]] },
+    "POST — Slack: Flag for review": { "main": [[{ "node": "POST — Slack: Daily summary",  "type": "main", "index": 0 }]] },
+    "Error Trigger":                 { "main": [[{ "node": "POST — Slack: Error alert",    "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "error-handler"
+  },
+  "tags": ["meta-ads", "al-ai", "optimizer", "gulf"]
+}
